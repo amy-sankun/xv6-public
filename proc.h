@@ -1,3 +1,4 @@
+#include "param.h"
 // Per-CPU state
 struct cpu {
   uchar apicid;                // Local APIC ID
@@ -56,3 +57,57 @@ struct proc {
 //   original data and bss
 //   fixed-size stack
 //   expandable heap
+
+// -------------------------------------------------------------------------
+
+// custom proc structure for using mlfq
+struct mproc {
+  struct proc* p;
+  int priority;
+  struct mproc* prev;
+  struct mproc* next;
+  int ticks_q;                   // ticks for using mlfq time quantum
+  int ticks_a;                   // ticks for using mlfq time allotment
+};
+
+#define MLFQ_SIZE 3  // number of mlfq level
+
+typedef struct MLFQ{
+    // int p_priority[NPROC];          // p_priority[pid] = priority
+    struct mproc procs[NPROC];    // pid; queue[0]:High, queue[1]:Mid, queue[2]:Low 
+    struct mproc* front[MLFQ_SIZE];           // q front 
+    struct mproc* rear[MLFQ_SIZE];           // number of processs in queue
+}Mlfq;
+
+
+void set_cpu_share(int share, int mode); // share is percentages
+
+
+void initMLFQ(int pid){
+  for (int i = 0; i < MLFQ_SIZE; ++i){
+    mlfq.front[i] = 0;
+    // mlfq.nproc[i] = 0;
+  }
+}
+
+void putMLFQ(struct proc* p);
+void changeMLFQ(struct mproc* mp, int priority);
+int getMLFQ();
+
+typedef struct Pass{
+    int pid;
+    int stride;
+    int ticket;
+    int pass_value;
+}Pass;
+
+typedef struct _Stride{
+    int t_total; // number of tickets total
+    int rate; //stride rate (max 80)
+    Pass* procs; // processes
+    Pass mlfq; // mlfq
+} Stride;
+
+int mlfq_limit_ticks[MLFQ_SIZE][2] = {{1,5},{2,10},{4,1000}};
+Mlfq mlfq;
+Stride stride;

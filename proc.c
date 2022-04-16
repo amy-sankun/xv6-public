@@ -532,3 +532,65 @@ procdump(void)
     cprintf("\n");
   }
 }
+
+
+
+void initMLFQ(int pid){
+  for (int i = 0; i < MLFQ_SIZE; ++i){
+    mlfq.front[i] = 0;
+    // mlfq.nproc[i] = 0;
+  }
+}
+
+void putMLFQ(struct proc* p){
+  int idx;
+  for (int i = 0; i < NPROC; ++i){
+    if(mlfq.procs[i].p == 0) idx = i;
+  }
+  mlfq.procs[idx].p = p;
+  mlfq.rear[0]->next = &mlfq.procs[idx];
+  mlfq.procs[idx].prev = mlfq.rear[0];
+  mlfq.rear[0] = &mlfq.procs[idx];
+  mlfq.procs[idx].priority = 0;
+  if(mlfq.front[0] == 0) mlfq.front[0] = &mlfq.procs[idx];
+  // init ticks
+  mlfq.procs[idx].ticks_a = 0;
+  mlfq.procs[idx].ticks_q = 0;
+}
+
+
+void changeMLFQ(struct mproc* mp, int priority){
+  //delete old priority queue
+  if(mp->prev != 0)
+    mp->prev->next = mp->next;
+  else
+    mlfq.front[mp->priority] = mp->next;
+  if(mp->next != 0)
+    mp->next->prev = mp->prev;
+  else
+    mlfq.rear[mp->priority] = mp->prev;
+
+  //insert new priority queue
+  mp->priority = priority;
+  mlfq.rear[priority]->next = mp;
+  mp->prev = mlfq.rear[priority];
+  mlfq.rear[priority] = mp;
+  if(mlfq.front[priority] == 0) mlfq.front[priority] = mp;
+  // init ticks
+  mp->ticks_a = 0;
+  mp->ticks_q = 0;
+}
+
+
+int getMLFQ(){
+  struct mproc* tmp;
+  for(int i = 0 ; i < MLFQ_SIZE; ++i){
+    tmp = mlfq.front[i];
+    while(tmp != 0){
+      if(tmp->ticks_q >= mlfq_limit_ticks[i][0] || tmp->ticks_a >= mlfq_limit_ticks[i][1]  ){
+        changeMLFQ(tmp, (i+1)%MLFQ_SIZE);
+      }
+    }
+
+  }
+}
