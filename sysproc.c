@@ -95,3 +95,34 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+
+int
+sys_yield(void)
+{
+  myyield();
+  return 0;
+}
+int 
+sys_getlev(void)
+{
+  struct proc* p = myproc();
+  if (p == 0) return -1;// there is no running process
+  
+  for(int i = 0 ; i < NPROC; ++i){
+    if(mlfq.procs[i].p == p){
+      return mlfq.procs[i].priority;
+    }
+  }
+  return -2; // error current process not in mlf
+}
+
+int 
+sys_set_cpu_share(void)
+{
+  int portion;
+  if(argint(0, &portion) < 0)
+    return -1;
+    
+  return allocate_stride(portion);
+}

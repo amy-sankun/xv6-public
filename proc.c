@@ -7,6 +7,7 @@
 #include "proc.h"
 #include "spinlock.h"
 
+
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
@@ -24,6 +25,8 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+  init_stride();
+  
 }
 
 // Must be called with interrupts disabled
@@ -111,6 +114,8 @@ found:
   p->context = (struct context*)sp;
   memset(p->context, 0, sizeof *p->context);
   p->context->eip = (uint)forkret;
+  putMLFQ(p);
+
 
   return p;
 }
@@ -287,6 +292,7 @@ wait(void)
       if(p->state == ZOMBIE){
         // Found one.
         pid = p->pid;
+        delete_stride(pid);
         kfree(p->kstack);
         p->kstack = 0;
         freevm(p->pgdir);
@@ -305,7 +311,6 @@ wait(void)
       release(&ptable.lock);
       return -1;
     }
-
     // Wait for children to exit.  (See wakeup1 call in proc_exit.)
     sleep(curproc, &ptable.lock);  //DOC: wait-sleep
   }
@@ -319,37 +324,39 @@ wait(void)
 //  - swtch to start running that process
 //  - eventually that process transfers control
 //      via swtch back to the scheduler.
+int tt = 0;
 void
 scheduler(void)
 {
   struct proc *p;
-  struct cpu *c = mycpu();
+  struct cpu *c = mycpu();  
   c->proc = 0;
   
   for(;;){
     // Enable interrupts on this processor.
     sti();
-
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
-
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      c->proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
-
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      c->proc = 0;
+    p = get_stride();
+    if(p->state != RUNNABLE){
+      goto OUT;
     }
+      
+    // Switch to chosen process.  It is the process's job
+    // to release ptable.lock and then reacquire it
+    // before jumping back to us.
+    c->proc = p;
+    switchuvm(p);
+    p->state = RUNNING;
+
+    swtch(&(c->scheduler), p->context);
+    switchkvm();
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming back.
+    c->proc = 0;
+    // }
+    OUT:
     release(&ptable.lock);
 
   }
@@ -389,6 +396,13 @@ yield(void)
   myproc()->state = RUNNABLE;
   sched();
   release(&ptable.lock);
+}
+
+
+void
+myyield(void)
+{
+  yield();
 }
 
 // A fork child's very first scheduling by scheduler()
@@ -535,62 +549,284 @@ procdump(void)
 
 
 
-void initMLFQ(int pid){
+
+int mlfq_limit_ticks[MLFQ_SIZE][2] = {{1,5},{2,10},{4,1000}};
+
+
+void initMLFQ(){
   for (int i = 0; i < MLFQ_SIZE; ++i){
     mlfq.front[i] = 0;
-    // mlfq.nproc[i] = 0;
+    mlfq.rear[i] = 0;    
   }
+  for (int i = 0; i < NPROC; ++i){
+    mlfq.procs[i].p = 0;
+  }
+  mlfq.ticks = 0;
 }
 
 void putMLFQ(struct proc* p){
-  int idx;
+  int idx = 0;
   for (int i = 0; i < NPROC; ++i){
     if(mlfq.procs[i].p == 0) idx = i;
   }
-  mlfq.procs[idx].p = p;
-  mlfq.rear[0]->next = &mlfq.procs[idx];
-  mlfq.procs[idx].prev = mlfq.rear[0];
-  mlfq.rear[0] = &mlfq.procs[idx];
-  mlfq.procs[idx].priority = 0;
-  if(mlfq.front[0] == 0) mlfq.front[0] = &mlfq.procs[idx];
-  // init ticks
+  // init
+  mlfq.procs[idx].next = 0;
+  mlfq.procs[idx].prev = 0; 
   mlfq.procs[idx].ticks_a = 0;
   mlfq.procs[idx].ticks_q = 0;
+  mlfq.procs[idx].priority = 0;
+  mlfq.procs[idx].p = p;
+  //insert queue
+  if(mlfq.front[0] == 0) {
+    mlfq.rear[0] = &mlfq.procs[idx];
+    mlfq.front[0] = &mlfq.procs[idx];
+  }
+  else{
+    mlfq.rear[0]->next = &mlfq.procs[idx];
+    mlfq.procs[idx].prev = mlfq.rear[0];
+    mlfq.rear[0] = &mlfq.procs[idx];
+  }
 }
 
 
-void changeMLFQ(struct mproc* mp, int priority){
+struct mproc* changeMLFQ(struct mproc* mp, int priority){
+  struct mproc* next = mp->next;
   //delete old priority queue
-  if(mp->prev != 0)
+  if(mp->prev != 0){
     mp->prev->next = mp->next;
-  else
+  }
+  else{
     mlfq.front[mp->priority] = mp->next;
-  if(mp->next != 0)
+    if(mlfq.front[mp->priority] != 0)
+      mlfq.front[mp->priority]->prev = 0;
+  }
+  if(mp->next != 0){
     mp->next->prev = mp->prev;
-  else
+  }
+  else{
     mlfq.rear[mp->priority] = mp->prev;
+    if(mlfq.rear[mp->priority] != 0)
+      mlfq.rear[mp->priority]->next = 0;
+  }
 
   //insert new priority queue
   mp->priority = priority;
-  mlfq.rear[priority]->next = mp;
-  mp->prev = mlfq.rear[priority];
-  mlfq.rear[priority] = mp;
-  if(mlfq.front[priority] == 0) mlfq.front[priority] = mp;
-  // init ticks
-  mp->ticks_a = 0;
-  mp->ticks_q = 0;
+  mp->next = 0;
+  mp->prev = 0;
+  if(mlfq.rear[priority] == 0){
+    mlfq.front[priority] = mp;
+    mlfq.rear[priority] = mp;
+  }
+  else{
+    mlfq.rear[priority]->next = mp;
+    mp->prev = mlfq.rear[priority];
+    mlfq.rear[priority] = mp;
+  }
+
+  return next;
+}
+
+void boostMLFQ(){
+  struct mproc* tmp;
+  for(int i = 1 ; i < MLFQ_SIZE; ++i){
+    tmp = mlfq.front[i];
+    while(tmp != 0){
+      tmp->ticks_a = 0;
+      tmp->ticks_q = 0;
+      tmp = changeMLFQ(tmp, 0);
+    }
+  }
+  mlfq.ticks = 0;
+
+  return;
+}
+
+struct proc* deleteMLFQ(int pid){
+  struct proc* p;
+  struct mproc* mp;
+  for(int i = 0 ; i < MLFQ_SIZE; ++i){
+    mp = mlfq.front[i];
+    while(mp != 0){
+      if(mp->p->pid == pid){
+        p = mp->p;
+        mp->p = 0;
+        if(mp->prev != 0){
+          mp->prev->next = mp->next;
+        }
+        else{
+          mlfq.front[mp->priority] = mp->next;
+          if(mlfq.front[mp->priority] != 0)
+            mlfq.front[mp->priority]->prev = 0;
+        }
+        if(mp->next != 0){
+          mp->next->prev = mp->prev;
+        }
+        else{
+          mlfq.rear[mp->priority] = mp->prev;
+          if(mlfq.rear[mp->priority] != 0)
+            mlfq.rear[mp->priority]->next = 0;
+        }
+        return p;
+      }
+      else mp = mp->next;
+    }
+  }
+  return 0;
 }
 
 
-int getMLFQ(){
+struct mproc* getMLFQ(){
+  struct mproc* tmp;
+  if(mlfq.ticks >= 100) boostMLFQ();
+  for(int i = 0 ; i < MLFQ_SIZE; ++i){
+    tmp = mlfq.front[i];
+    while(tmp != 0){
+      if(tmp->p->state == UNUSED) {
+        tmp = tmp->next;
+        deleteMLFQ(tmp->p->pid);
+      }
+      if(tmp->ticks_a >= mlfq_limit_ticks[i][1]){ //alloment
+        tmp->ticks_a = 0;
+        tmp->ticks_q = 0;
+        tmp = changeMLFQ(tmp, (i+1)%MLFQ_SIZE);
+      }
+      else if(tmp->ticks_q >= mlfq_limit_ticks[i][0]){//quantum
+        tmp->ticks_q = 0;
+        tmp = changeMLFQ(tmp, i);
+      }
+      else  tmp = tmp->next;
+    }
+  }
+  for(int i = 0 ; i < MLFQ_SIZE; ++i){
+    tmp = mlfq.front[i];
+    if(tmp != 0){
+      return tmp;
+    }
+  }
+  return 0;
+}
+
+
+void printMLFQ(void){
+  struct mproc* tmp;
+  for(int i = 0 ; i < MLFQ_SIZE; ++i){
+    tmp = mlfq.front[i];
+    cprintf("priority %d : ", i);
+    while(tmp != 0){
+      cprintf("(pid : %d, status : %d) ", tmp->p->pid, tmp->p->state);
+      tmp = tmp->next;
+    }
+    cprintf("\n");
+  }
+}
+
+
+struct proc* get_stride(){
+  int idx;
+  while(1){
+  idx = find_min_stride();
+  if(idx != -1 && stride.procs[idx].p->state == UNUSED) {
+    delete_stride(stride.procs[idx].p->pid);
+    continue;
+  }
+  break;
+  }
+  if(idx == -1 || stride.mlfq.pass_value < stride.procs[idx].pass_value){
+    if(stride.mlfq.pass_value > stride.t_total){
+      reduce_all_pass(stride.mlfq.pass_value);
+    }
+    stride.mlfq.pass_value += stride.mlfq.stride;
+    mlfq.ticks++;
+    struct mproc* mp= getMLFQ();
+    mp->ticks_a++;
+    mp->ticks_q++;
+    return mp->p;
+  }
+  else{
+    if(stride.procs[idx].pass_value > stride.t_total){
+      reduce_all_pass(stride.procs[idx].pass_value);
+    }
+    stride.procs[idx].pass_value += stride.procs[idx].stride;
+    return stride.procs[idx].p;
+
+  }
+  return 0;
+
+}
+
+void init_stride(){
+  initMLFQ();
+  stride.t_total = 6400;
+  stride.p_total = 0;
+  stride.mlfq.ticket = 6400;
+  stride.mlfq.stride = stride.t_total / stride.mlfq.ticket;
+  stride.mlfq.portion = 100;
+  stride.mlfq.pass_value = 0;
+  for(int i = 0 ; i < NPROC; ++i){
+    stride.procs[i].p = 0;
+  }
+}
+
+int allocate_stride(int portion){
+  struct proc* p = myproc();
+  if(portion < 0 || portion > 80|| stride.mlfq.portion - portion < 20 || p == 0) return -1;
   struct mproc* tmp;
   for(int i = 0 ; i < MLFQ_SIZE; ++i){
     tmp = mlfq.front[i];
     while(tmp != 0){
-      if(tmp->ticks_q >= mlfq_limit_ticks[i][0] || tmp->ticks_a >= mlfq_limit_ticks[i][1]  ){
-        changeMLFQ(tmp, (i+1)%MLFQ_SIZE);
+      if(tmp->p == p){
+        for(int j = 0 ; j < NPROC; ++j){
+          if(stride.procs[j].p == 0){
+            deleteMLFQ(p->pid);
+            stride.procs[j].p = p;
+            stride.procs[j].portion = portion;
+            stride.procs[j].pass_value = stride.p_total/2;
+            stride.procs[j].ticket = stride.t_total * portion / 100;
+            stride.procs[j].stride = stride.t_total / stride.procs[j].ticket;
+            stride.mlfq.ticket -= stride.procs[j].ticket;
+            stride.mlfq.portion -=  portion;
+            stride.mlfq.stride =  stride.t_total / stride.mlfq.ticket;
+            return 0;
+          }
+        }
+
       }
     }
-
   }
+  return -1;
+}
+
+void delete_stride(int pid){
+  for(int i = 0 ; i < NPROC; ++i){
+    if(stride.procs[i].p->pid == pid){
+      stride.procs[i].p = 0;
+      stride.mlfq.ticket += stride.procs[i].ticket;
+      stride.mlfq.portion += stride.procs[i].portion;
+      stride.mlfq.stride =  stride.t_total / stride.mlfq.ticket;
+      stride.p_total -= stride.procs[i].pass_value;
+      return;
+    }
+  }
+  deleteMLFQ(pid);
+}
+
+int find_min_stride(){
+  int min_pass = __INT32_MAX__;
+  int idx = -1;
+  for(int i = 0 ; i < NPROC; ++i){
+    if(stride.procs[i].p != 0 && stride.procs[i].pass_value < min_pass){
+      min_pass = stride.procs[i].pass_value;
+      idx = i;
+    }
+  }
+  return idx;
+}
+void reduce_all_pass(int value){
+  stride.mlfq.pass_value -= value;
+  for(int i = 0 ; i < NPROC; ++i){
+    if(stride.procs[i].p != 0){
+      stride.procs[i].pass_value -= value;
+    }
+  }
+  return;
 }

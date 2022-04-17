@@ -1,4 +1,5 @@
 #include "param.h"
+
 // Per-CPU state
 struct cpu {
   uchar apicid;                // Local APIC ID
@@ -59,6 +60,7 @@ struct proc {
 //   expandable heap
 
 // -------------------------------------------------------------------------
+void myyield(void);
 
 // custom proc structure for using mlfq
 struct mproc {
@@ -66,48 +68,50 @@ struct mproc {
   int priority;
   struct mproc* prev;
   struct mproc* next;
-  int ticks_q;                   // ticks for using mlfq time quantum
   int ticks_a;                   // ticks for using mlfq time allotment
+  int ticks_q;                   // ticks for using mlfq time quantum
 };
 
 #define MLFQ_SIZE 3  // number of mlfq level
 
 typedef struct MLFQ{
-    // int p_priority[NPROC];          // p_priority[pid] = priority
-    struct mproc procs[NPROC];    // pid; queue[0]:High, queue[1]:Mid, queue[2]:Low 
+    struct mproc procs[NPROC];                // mproc container 
     struct mproc* front[MLFQ_SIZE];           // q front 
-    struct mproc* rear[MLFQ_SIZE];           // number of processs in queue
+    struct mproc* rear[MLFQ_SIZE];            //  q rear
+    int ticks;                                // if ticks > 100 => boosting
 }Mlfq;
 
-
-void set_cpu_share(int share, int mode); // share is percentages
-
-
-void initMLFQ(int pid){
-  for (int i = 0; i < MLFQ_SIZE; ++i){
-    mlfq.front[i] = 0;
-    // mlfq.nproc[i] = 0;
-  }
-}
-
-void putMLFQ(struct proc* p);
-void changeMLFQ(struct mproc* mp, int priority);
-int getMLFQ();
-
-typedef struct Pass{
-    int pid;
+typedef struct _Pass{
+    struct proc* p;
     int stride;
     int ticket;
     int pass_value;
+    int portion;
 }Pass;
 
 typedef struct _Stride{
     int t_total; // number of tickets total
-    int rate; //stride rate (max 80)
-    Pass* procs; // processes
+    int p_total; // number of pass total
+    Pass procs[NPROC]; // processes
     Pass mlfq; // mlfq
 } Stride;
 
-int mlfq_limit_ticks[MLFQ_SIZE][2] = {{1,5},{2,10},{4,1000}};
+
+void putMLFQ(struct proc* p);
+struct mproc* changeMLFQ(struct mproc* mp, int priority);
+struct mproc* getMLFQ();
+void boostMLFQ();
+void initMLFQ();
+struct proc* deleteMLFQ(int pid);
+void printMLFQ(void);
+int allocate_stride(int portion);
+
+struct proc* get_stride();
+void init_stride();
+void delete_stride(int pid);
+int find_min_stride();
+void reduce_all_pass(int value);
 Mlfq mlfq;
 Stride stride;
+
+
