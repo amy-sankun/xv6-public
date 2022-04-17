@@ -335,6 +335,7 @@ scheduler(void)
   for(;;){
     // Enable interrupts on this processor.
     sti();
+
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
     p = get_stride();
@@ -355,7 +356,6 @@ scheduler(void)
     // Process is done running for now.
     // It should have changed its p->state before coming back.
     c->proc = 0;
-    // }
     OUT:
     release(&ptable.lock);
 
@@ -724,18 +724,19 @@ void printMLFQ(void){
 struct proc* get_stride(){
   int idx;
   while(1){
-  idx = find_min_stride();
-  if(idx != -1 && stride.procs[idx].p->state == UNUSED) {
-    delete_stride(stride.procs[idx].p->pid);
-    continue;
+    idx = find_min_stride();
+    if(idx != -1 && stride.procs[idx].p->state == UNUSED) {
+      delete_stride(stride.procs[idx].p->pid);
+      continue;
+    }
+    break;
   }
-  break;
-  }
-  if(idx == -1 || stride.mlfq.pass_value < stride.procs[idx].pass_value){
+  if(idx == -1 || stride.mlfq.pass_value <= stride.procs[idx].pass_value){
     if(stride.mlfq.pass_value > stride.t_total){
       reduce_all_pass(stride.mlfq.pass_value);
     }
     stride.mlfq.pass_value += stride.mlfq.stride;
+    stride.p_total += stride.mlfq.stride;
     mlfq.ticks++;
     struct mproc* mp= getMLFQ();
     mp->ticks_a++;
@@ -747,6 +748,7 @@ struct proc* get_stride(){
       reduce_all_pass(stride.procs[idx].pass_value);
     }
     stride.procs[idx].pass_value += stride.procs[idx].stride;
+    stride.p_total += stride.procs[idx].stride;
     return stride.procs[idx].p;
 
   }
@@ -758,6 +760,7 @@ void init_stride(){
   initMLFQ();
   stride.t_total = 6400;
   stride.p_total = 0;
+  stride.num = 1;
   stride.mlfq.ticket = 6400;
   stride.mlfq.stride = stride.t_total / stride.mlfq.ticket;
   stride.mlfq.portion = 100;
@@ -780,12 +783,14 @@ int allocate_stride(int portion){
             deleteMLFQ(p->pid);
             stride.procs[j].p = p;
             stride.procs[j].portion = portion;
-            stride.procs[j].pass_value = stride.p_total/2;
+            stride.procs[j].pass_value = stride.p_total / stride.num;
             stride.procs[j].ticket = stride.t_total * portion / 100;
             stride.procs[j].stride = stride.t_total / stride.procs[j].ticket;
             stride.mlfq.ticket -= stride.procs[j].ticket;
             stride.mlfq.portion -=  portion;
             stride.mlfq.stride =  stride.t_total / stride.mlfq.ticket;
+            stride.num++;
+            stride.p_total += stride.procs[j].pass_value;
             return 0;
           }
         }
@@ -804,6 +809,7 @@ void delete_stride(int pid){
       stride.mlfq.portion += stride.procs[i].portion;
       stride.mlfq.stride =  stride.t_total / stride.mlfq.ticket;
       stride.p_total -= stride.procs[i].pass_value;
+      stride.num -= 1;
       return;
     }
   }
@@ -811,7 +817,7 @@ void delete_stride(int pid){
 }
 
 int find_min_stride(){
-  int min_pass = __INT32_MAX__;
+  int min_pass = 12800;
   int idx = -1;
   for(int i = 0 ; i < NPROC; ++i){
     if(stride.procs[i].p != 0 && stride.procs[i].pass_value < min_pass){
@@ -822,6 +828,7 @@ int find_min_stride(){
   return idx;
 }
 void reduce_all_pass(int value){
+  stride.p_total -= value*stride.num;
   stride.mlfq.pass_value -= value;
   for(int i = 0 ; i < NPROC; ++i){
     if(stride.procs[i].p != 0){
@@ -830,3 +837,16 @@ void reduce_all_pass(int value){
   }
   return;
 }
+
+void print_scheduler(){
+  cprintf("Sride\n");
+  for(int i = 0 ; i < NPROC; ++i){
+    if(stride.procs[i].p != 0){
+      cprintf("(pid %d state %d pass %d portion %d stride %d) ",stride.procs[i].p->pid, stride.procs[i].p->state, stride.procs[i].pass_value, stride.procs[i].portion,stride.procs[i].stride);
+    }
+  }
+  cprintf("\nMLFQ(pass %d portion %d stride %d)\n", stride.mlfq.pass_value, stride.mlfq.portion, stride.mlfq.stride);
+  printMLFQ();  
+  cprintf("\n");
+}
+

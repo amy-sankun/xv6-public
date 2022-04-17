@@ -92,6 +92,7 @@ typedef struct _Pass{
 typedef struct _Stride{
     int t_total; // number of tickets total
     int p_total; // number of pass total
+    int num;
     Pass procs[NPROC]; // processes
     Pass mlfq; // mlfq
 } Stride;
@@ -111,6 +112,8 @@ void init_stride();
 void delete_stride(int pid);
 int find_min_stride();
 void reduce_all_pass(int value);
+
+void print_scheduler();
 Mlfq mlfq;
 Stride stride;
 
