@@ -13,9 +13,15 @@ struct {
   struct proc proc[NPROC];
 } ptable;
 
+struct {
+  struct spinlock lock;
+  thrd threads[NTHRD];
+} thread_pool;
+
 static struct proc *initproc;
 
 int nextpid = 1;
+int nextthid = 1;
 extern void forkret(void);
 extern void trapret(void);
 
@@ -25,8 +31,9 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+  initlock(&thread_pool.lock, "thread_pool");
+  init_thread_pool();
   init_stride();
-  
 }
 
 // Must be called with interrupts disabled
@@ -69,7 +76,7 @@ myproc(void) {
 }
 
 //PAGEBREAK: 32
-// Look in the process table for an UNUSED proc.
+// Look in the process table for an UNUSED_T proc.
 // If found, change state to EMBRYO and initialize
 // state required to run in the kernel.
 // Otherwise return 0.
@@ -77,7 +84,6 @@ static struct proc*
 allocproc(void)
 {
   struct proc *p;
-  char *sp;
 
   acquire(&ptable.lock);
 
@@ -95,27 +101,10 @@ found:
   release(&ptable.lock);
 
   // Allocate kernel stack.
-  if((p->kstack = kalloc()) == 0){
-    p->state = UNUSED;
-    return 0;
-  }
-  sp = p->kstack + KSTACKSIZE;
-
-  // Leave room for trap frame.
-  sp -= sizeof *p->tf;
-  p->tf = (struct trapframe*)sp;
-
-  // Set up new context to start executing at forkret,
-  // which returns to trapret.
-  sp -= 4;
-  *(uint*)sp = (uint)trapret;
-
-  sp -= sizeof *p->context;
-  p->context = (struct context*)sp;
-  memset(p->context, 0, sizeof *p->context);
-  p->context->eip = (uint)forkret;
+  p->threads = allocthrd();
+  p->threads->parent = p;
+  p->threads->state = EMBRYO_T;
   putMLFQ(p);
-
 
   return p;
 }
@@ -135,14 +124,14 @@ userinit(void)
     panic("userinit: out of memory?");
   inituvm(p->pgdir, _binary_initcode_start, (int)_binary_initcode_size);
   p->sz = PGSIZE;
-  memset(p->tf, 0, sizeof(*p->tf));
-  p->tf->cs = (SEG_UCODE << 3) | DPL_USER;
-  p->tf->ds = (SEG_UDATA << 3) | DPL_USER;
-  p->tf->es = p->tf->ds;
-  p->tf->ss = p->tf->ds;
-  p->tf->eflags = FL_IF;
-  p->tf->esp = PGSIZE;
-  p->tf->eip = 0;  // beginning of initcode.S
+  memset(p->threads->tf, 0, sizeof(*p->threads->tf));
+  p->threads->tf->cs = (SEG_UCODE << 3) | DPL_USER;
+  p->threads->tf->ds = (SEG_UDATA << 3) | DPL_USER;
+  p->threads->tf->es = p->threads->tf->ds;
+  p->threads->tf->ss = p->threads->tf->ds;
+  p->threads->tf->eflags = FL_IF;
+  p->threads->tf->esp = PGSIZE;
+  p->threads->tf->eip = 0;  // beginning of initcode.S
 
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
@@ -154,6 +143,7 @@ userinit(void)
   acquire(&ptable.lock);
 
   p->state = RUNNABLE;
+  p->threads->state = RUNNABLE;
 
   release(&ptable.lock);
 }
@@ -196,21 +186,22 @@ fork(void)
 
   // Copy process state from proc.
   if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
-    kfree(np->kstack);
-    np->kstack = 0;
+    kfree(np->threads->kstack);
+    np->threads->state = UNUSED;
+    np->threads = 0;
     np->state = UNUSED;
     return -1;
   }
   np->sz = curproc->sz;
   np->parent = curproc;
-  *np->tf = *curproc->tf;
+  *np->threads->tf = *curproc->threads->tf;
 
   // Clear %eax so that fork returns 0 in the child.
-  np->tf->eax = 0;
+  np->threads->tf->eax = 0;
 
   for(i = 0; i < NOFILE; i++)
-    if(curproc->ofile[i])
-      np->ofile[i] = filedup(curproc->ofile[i]);
+    if(curproc->threads->ofile[i])
+      np->threads->ofile[i] = filedup(curproc->threads->ofile[i]);
   np->cwd = idup(curproc->cwd);
 
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
@@ -220,6 +211,7 @@ fork(void)
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
+  np->threads->state = RUNNABLE;
 
   release(&ptable.lock);
 
@@ -233,6 +225,7 @@ void
 exit(void)
 {
   struct proc *curproc = myproc();
+  thrd *t = curproc->threads;
   struct proc *p;
   int fd;
 
@@ -240,10 +233,12 @@ exit(void)
     panic("init exiting");
 
   // Close all open files.
-  for(fd = 0; fd < NOFILE; fd++){
-    if(curproc->ofile[fd]){
-      fileclose(curproc->ofile[fd]);
-      curproc->ofile[fd] = 0;
+  while(t != 0){
+    for(fd = 0; fd < NOFILE; fd++){
+      if(t->ofile[fd]){
+        fileclose(t->ofile[fd]);
+        t->ofile[fd] = 0;
+      }
     }
   }
 
@@ -280,6 +275,7 @@ wait(void)
   struct proc *p;
   int havekids, pid;
   struct proc *curproc = myproc();
+  thrd *t = curproc->threads;
   
   acquire(&ptable.lock);
   for(;;){
@@ -293,14 +289,16 @@ wait(void)
         // Found one.
         pid = p->pid;
         delete_stride(pid);
-        kfree(p->kstack);
-        p->kstack = 0;
+        while(t != 0){
+          thrd_init(t);
+        }
         freevm(p->pgdir);
         p->pid = 0;
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;
         p->state = UNUSED;
+        p->threads = 0;
         release(&ptable.lock);
         return pid;
       }
@@ -350,8 +348,9 @@ scheduler(void)
     c->proc = p;
     switchuvm(p);
     p->state = RUNNING;
+    p->threads->state = RUNNING;
 
-    swtch(&(c->scheduler), p->context);
+    swtch(&(c->scheduler), p->threads->context);
     switchkvm();
 
     // Process is done running for now.
@@ -385,7 +384,7 @@ sched(void)
   if(readeflags()&FL_IF)
     panic("sched interruptible");
   intena = mycpu()->intena;
-  swtch(&p->context, mycpu()->scheduler);
+  swtch(&p->threads->context, mycpu()->scheduler);
   mycpu()->intena = intena;
 }
 
@@ -395,6 +394,7 @@ yield(void)
 {
   acquire(&ptable.lock);  //DOC: yieldlock
   myproc()->state = RUNNABLE;
+  myproc()->threads->state = RUNNABLE;
   sched();
   release(&ptable.lock);
 }
@@ -540,7 +540,7 @@ procdump(void)
       state = "???";
     cprintf("%d %s %s", p->pid, state, p->name);
     if(p->state == SLEEPING){
-      getcallerpcs((uint*)p->context->ebp+2, pc);
+      getcallerpcs((uint*)p->threads->context->ebp+2, pc);
       for(i=0; i<10 && pc[i] != 0; i++)
         cprintf(" %p", pc[i]);
     }
@@ -550,9 +550,10 @@ procdump(void)
 
 
 
-
-int mlfq_limit_ticks[MLFQ_SIZE][2] = {{1,5},{2,10},{4,1000}};
-
+// limit ticks alloment and quantum per mlfq level
+int mlfq_limit_ticks[MLFQ_SIZE][2] = {{5,20},{10,40},{20,1000}};
+int stride_tick = 5;
+int thread_tick = 1;
 
 void initMLFQ(){
   for (int i = 0; i < MLFQ_SIZE; ++i){
@@ -589,7 +590,7 @@ void putMLFQ(struct proc* p){
   }
 }
 
-
+// change mlfq level to priority
 struct mproc* changeMLFQ(struct mproc* mp, int priority){
   struct mproc* next = mp->next;
   //delete old priority queue
@@ -627,6 +628,7 @@ struct mproc* changeMLFQ(struct mproc* mp, int priority){
   return next;
 }
 
+// boost procs to priority 0
 void boostMLFQ(){
   struct mproc* tmp;
   for(int i = 1 ; i < MLFQ_SIZE; ++i){
@@ -699,12 +701,12 @@ struct mproc* getMLFQ(){
       else  tmp = tmp->next;
     }
   }
-  mlfq.ticks++;
+  mlfq.ticks += 5;
   for(int i = 0 ; i < MLFQ_SIZE; ++i){
     tmp = mlfq.front[i];
     if(tmp != 0){
-      tmp->ticks_a++;
-      tmp->ticks_q++;
+      tmp->ticks_a += 5;
+      tmp->ticks_q += 5;
       if(tmp->p->state != RUNNABLE){
         changeMLFQ(tmp, tmp->priority);
       }
@@ -741,18 +743,31 @@ struct proc* get_stride(){
 
     break;
   }
+  if(stride.tick++ != 5){
+    stride.tick++;
+    struct proc* p = myproc();
+    thrd* t = p->threads;
+    thrd* tail = p->threads;
+    while(tail->next != 0){
+      tail = tail->next;
+    }
+    if(t != tail){
+      tail->next = t;
+      mp->p->threads = t->next;
+    }
+    return myproc();
+  } 
+  stride.tick = 0;
   if(idx == -1 || stride.mlfq.pass_value <= stride.procs[idx].pass_value){
     mp= getMLFQ();
     if(stride.mlfq.pass_value > stride.t_total * 10){
       reduce_all_pass(stride.mlfq.pass_value);
     }
     if(mp->p->state != RUNNABLE){
-      // cprintf("goto stride\n");
       goto STRIDE;
       RET:
       return mp->p;
     }
-    // cprintf("select mlfq\n");
     stride.mlfq.pass_value += stride.mlfq.stride;
     stride.p_total += stride.mlfq.stride;
     return mp->p;
@@ -782,6 +797,7 @@ void init_stride(){
   stride.mlfq.stride = stride.t_total * 10  / stride.mlfq.ticket;
   stride.mlfq.portion = 100;
   stride.mlfq.pass_value = 0;
+  stride.tick = 0;
   for(int i = 0 ; i < NPROC; ++i){
     stride.procs[i].p = 0;
   }
@@ -808,6 +824,7 @@ int allocate_stride(int portion){
             stride.mlfq.stride =  stride.t_total * 10 / stride.mlfq.ticket;
             stride.num++;
             stride.p_total += stride.procs[j].pass_value;
+            stride.tick = 0;
             return 0;
           }
         }
@@ -844,6 +861,7 @@ int find_min_stride(){
   }
   return idx;
 }
+
 void reduce_all_pass(int value){
   stride.p_total -= value*stride.num;
   stride.mlfq.pass_value -= value;
@@ -867,3 +885,188 @@ void print_scheduler(){
   cprintf("\n");
 }
 
+thrd* get_new_thrd(void){
+  acquire(&thread_pool.lock);
+  thrd* t;
+  for(t = thread_pool.threads; t < &thread_pool.threads[NTHRD]; t++){
+    if(t->state == UNUSED_T){
+      release(&thread_pool.lock);
+      return t;
+    } 
+  }
+  release(&thread_pool.lock);
+  return 0;
+}
+
+thrd* allocthrd(void){
+  char *sp;
+
+  thrd* t = get_new_thrd();
+  if(t == 0) return 0;
+
+  t->thid = nextthid++;
+
+  // Allocate kernel stack.
+  if((t->kstack = kalloc()) == 0){
+    t->state = UNUSED_T;
+    return 0;
+  }
+  sp = t->kstack + KSTACKSIZE;
+
+  // Leave room for trap frame.
+  sp -= sizeof *t->tf;
+  t->tf = (struct trapframe*)sp;
+
+  // Set up new context to start executing at forkret,
+  // which returns to trapret.
+  sp -= 4;
+  *(uint*)sp = (uint)trapret;
+
+  sp -= sizeof *t->context;
+  t->context = (struct context*)sp;
+  memset(t->context, 0, sizeof *t->context);
+  t->context->eip = (uint)forkret;
+
+  t->next = 0;
+
+  return t;
+}
+
+
+void init_thread_pool(){
+  thrd* t;
+  for(t = thread_pool.threads; t < &thread_pool.threads[NTHRD]; t++){
+      t->state = UNUSED_T;
+      t->thid = 0;
+      t->parent = 0;
+      t->next = 0;
+      t->ret_val = 0;
+      t->kstack = 0;
+  }
+}
+
+int thread_create(thread_t * thread, void * (*start_routine)(void *), void *arg)
+{
+  struct proc* p = myproc();
+  thrd* t = allocthrd();
+  uint sz;
+
+  if(t == 0) return -1;
+
+  // Allocate user stack.
+  sz = PGROUNDUP(p->sz);
+  if ((sz = allocuvm(p->pgdir, sz, sz + 2*PGSIZE)) == 0)
+    goto bad;
+
+  t->next = p->threads;
+  p->threads = t;
+  t->parent = p;
+  p->sz = sz;
+  *thread = t->thid;
+
+  // Push argument, prepare rest of stack in ustack.
+  sz -= 4;
+  *(uint *)sz = (uint)arg;
+
+  // fake return PC
+  sz -= 4;
+  *(uint *)sz = 0xffffffff;
+
+  // Commit to the user image.
+  *((uint*)t->tf->eip) = (uint)start_routine;
+  *((uint*)t->tf->esp) = sz;
+
+
+  t->state = RUNNABLE;
+
+
+  return 0;
+
+bad:
+  thrd_init(t);
+
+  return -1;
+}
+
+void thread_exit(void *retval)
+{
+  struct proc *p = myproc();
+  thrd* t = p->threads;
+  int fd;
+
+  if(t == 0) {
+    panic("thread not exist");
+    return;
+  }
+  t->state = ZOMBIE_T;
+  t->ret_val = retval;
+
+  
+  for(fd = 0; fd < NOFILE; fd++){
+    if(t->ofile[fd]){
+      fileclose(t->ofile[fd]);
+      t->ofile[fd] = 0;
+    }
+  }
+
+  if(t->parent == p) {
+    exit();
+    return;
+  }
+
+  void* chan = t->chan;
+  while(t != 0){
+    if(t->state == SLEEPING_T && t->chan == chan)
+      t->state = RUNNABLE_T;
+    t = t->next;
+  }
+  
+  acquire(&ptable.lock);
+  sched();
+  panic("zombie exit");
+}
+
+int thread_join(thread_t thread, void **retval)
+{ 
+  struct proc *p = myproc();
+  thrd *t = p->threads;
+
+  while(t != 0){
+    if(t->thid == thread){
+      if(t->state == UNUSED_T) return -1;
+      break;
+    }
+    t = t->next;
+  }
+
+  acquire(&ptable.lock);
+  if (t->state != ZOMBIE_T){
+    p->threads->chan = p->threads;
+    p->threads->state = SLEEPING_T;
+    t->chan = p->threads;
+    t->parent = p->threads;
+    sched();
+
+    p->threads->chan = 0;
+  }
+
+  *retval = t->ret_val;
+
+  deallocuvm(p->pgdir, p->sz, p->sz - 2*PGSIZE);
+  thrd_init(t);
+  
+  release(&ptable.lock);
+
+  return 0;
+}
+
+void thrd_init(thrd* t){
+  kfree(t->kstack);
+  t->chan = 0;
+  t->kstack = 0;
+  t->parent = 0;
+  t->thid = 0;
+  t->next = 0;
+  t->ret_val = 0;
+  t->state = UNUSED_T;
+}

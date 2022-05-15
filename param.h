@@ -1,4 +1,5 @@
 #define NPROC        64  // maximum number of processes
+#define NTHRD        130  // maximum number of threads
 #define KSTACKSIZE 4096  // size of per-process kernel stack
 #define NCPU          8  // maximum number of CPUs
 #define NOFILE       64  // open files per process

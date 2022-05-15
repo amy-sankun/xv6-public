@@ -35,22 +35,36 @@ struct context {
 };
 
 enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+enum thrdstate { UNUSED_T, EMBRYO_T, SLEEPING_T, RUNNABLE_T, RUNNING_T, ZOMBIE_T };
+
+typedef struct _thrd thrd;
+
 
 // Per-process state
 struct proc {
   uint sz;                     // Size of process memory (bytes)
   pde_t* pgdir;                // Page table
-  char *kstack;                // Bottom of kernel stack for this process
   enum procstate state;        // Process state
   int pid;                     // Process ID
   struct proc *parent;         // Parent process
+  struct inode *cwd;           // Current directory
+  char name[16];               // Process name (debugging)
+  int killed;                  // If non-zero, have been killed
+  thrd* threads;
+  void *chan;                  // have to remove
+};
+
+struct _thrd {
+  char *kstack;                // Bottom of kernel stack for this process
+  enum thrdstate state;        // Thread state
+  thread_t thid;               // Thread ID
+  void *parent;         // Parent process
   struct trapframe *tf;        // Trap frame for current syscall
   struct context *context;     // swtch() here to run process
   void *chan;                  // If non-zero, sleeping on chan
-  int killed;                  // If non-zero, have been killed
   struct file *ofile[NOFILE];  // Open files
-  struct inode *cwd;           // Current directory
-  char name[16];               // Process name (debugging)
+  thrd* next;
+  void * ret_val;
 };
 
 // Process memory is laid out contiguously, low addresses first:
@@ -86,7 +100,7 @@ typedef struct _Pass{
     int stride;
     int ticket;
     int pass_value;
-    int portion;
+    int portion; // cpu share
 }Pass;
 
 typedef struct _Stride{
@@ -95,18 +109,19 @@ typedef struct _Stride{
     int num;
     Pass procs[NPROC]; // processes
     Pass mlfq; // mlfq
+    int tick;
 } Stride;
 
 
+void initMLFQ();
 void putMLFQ(struct proc* p);
 struct mproc* changeMLFQ(struct mproc* mp, int priority);
 struct mproc* getMLFQ();
 void boostMLFQ();
-void initMLFQ();
 struct proc* deleteMLFQ(int pid);
 void printMLFQ(void);
-int allocate_stride(int portion);
 
+int allocate_stride(int portion);
 struct proc* get_stride();
 void init_stride();
 void delete_stride(int pid);
@@ -117,4 +132,11 @@ void print_scheduler();
 Mlfq mlfq;
 Stride stride;
 
+
+thrd* allocthrd(void);
+int thread_create(thread_t * thread, void * (*start_routine)(void *), void *arg);
+void thread_exit(void *retval);
+int thread_join(thread_t thread, void **retval);
+void thrd_init(thrd* t);
+void init_thread_pool();
 
